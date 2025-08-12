@@ -1,1 +1,541 @@
 
+
+# Python
+__pycache__/
+.python-version
+.venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# Jupyter / misc
+.ipynb_checkpoints/
+
+
+import io
+import json
+from datetime import date, timedelta
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objs as go
+import plotly.io as pio
+import streamlit as st
+import yfinance as yf
+
+# -------------------------- Helpers --------------------------
+
+st.set_page_config(page_title="Stock Market Visualizer", page_icon="📈", layout="wide")
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+@st.cache_data(show_spinner=False, ttl=60 * 5)
+def fetch_price_history(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=False, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        # If multiple tickers accidentally passed, take the first level
+        df = df.xs(ticker, axis=1, level=0, drop_level=False).droplevel(0, axis=1)
+    df = df.dropna(how="all")
+    return df
+
+@st.cache_data(show_spinner=False, ttl=60 * 10)
+def fetch_multi_price_history(tickers: List[str], start: str, end: str, interval: str) -> pd.DataFrame:
+    df = yf.download(tickers, start=start, end=end, interval=interval, auto_adjust=False, progress=False)
+    # Standardize to simple columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df['Adj Close'] if 'Adj Close' in df.columns.levels[0] else df['Close']
+    return df.dropna(how="all")
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def fetch_fast_info(ticker: str) -> Dict[str, Any]:
+    t = yf.Ticker(ticker)
+    info = {}
+    # Attempt multiple sources; yfinance fields vary by listing
+    try:
+        info.update(t.fast_info.__dict__)
+    except Exception:
+        pass
+    try:
+        # .info can be slow/unreliable; guard heavily
+        base = t.info
+        # extract common ratios if present
+        for k in [
+            "trailingPE", "forwardPE", "priceToBook", "pegRatio", "dividendYield",
+            "profitMargins", "returnOnEquity", "currentRatio", "quickRatio",
+            "debtToEquity", "beta", "bookValue", "trailingEps", "forwardEps",
+            "marketCap", "enterpriseValue"
+        ]:
+            if k in base:
+                info[k] = base[k]
+    except Exception:
+        pass
+    return info
+
+def compute_indicators(df: pd.DataFrame, ma_windows: List[int], bb_window: int, bb_std: float, rsi_window: int) -> pd.DataFrame:
+    out = df.copy()
+    close = out['Close']
+    # Moving averages
+    for w in ma_windows:
+        out[f"MA_{w}"] = close.rolling(w).mean()
+
+    # Bollinger Bands
+    ma = close.rolling(bb_window).mean()
+    std = close.rolling(bb_window).std()
+    out["BB_Middle"] = ma
+    out["BB_Upper"] = ma + bb_std * std
+    out["BB_Lower"] = ma - bb_std * std
+
+    # RSI
+    delta = close.diff()
+    gain = delta.clip(lower=0.0).fillna(0.0)
+    loss = (-delta.clip(upper=0.0)).fillna(0.0)
+    avg_gain = gain.rolling(rsi_window).mean()
+    avg_loss = loss.rolling(rsi_window).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    out["RSI"] = 100 - (100 / (1 + rs))
+    return out
+
+def make_candlestick_figure(df: pd.DataFrame, overlays: Dict[str, Any], theme: str = "plotly") -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        name='OHLC'
+    ))
+    # Overlays
+    for ma_def in overlays.get("ma", []):
+        col = ma_def["color"]
+        w = ma_def["window"]
+        key = f"MA_{w}"
+        if key in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[key], mode='lines', name=f"MA {w}", line=dict(color=col)))
+    if overlays.get("bollinger", {}).get("enabled") and {"BB_Upper","BB_Middle","BB_Lower"} <= set(df.columns):
+        bb = overlays["bollinger"]
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_Upper"], name="BB Upper", mode="lines",
+                                 line=dict(dash="dot", width=1.5, color=bb.get("color_upper"))))
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_Middle"], name="BB Middle", mode="lines",
+                                 line=dict(dash="dash", width=1.5, color=bb.get("color_middle"))))
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_Lower"], name="BB Lower", mode="lines",
+                                 line=dict(dash="dot", width=1.5, color=bb.get("color_lower"))))
+    fig.update_layout(xaxis_rangeslider_visible=False, template=theme, margin=dict(l=10, r=10, t=30, b=10))
+    return fig
+
+def rsi_chart(df: pd.DataFrame, thresholds: Tuple[float, float], color_line: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], mode="lines", name="RSI", line=dict(width=2, color=color_line)))
+    low, high = thresholds
+    fig.add_hline(y=high, line_dash="dot", annotation_text=f"Overbought {high}", annotation_position="top left")
+    fig.add_hline(y=low, line_dash="dot", annotation_text=f"Oversold {low}", annotation_position="bottom left")
+    fig.update_yaxes(range=[0,100])
+    fig.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+    return fig
+
+def correlation_heatmap(prices: pd.DataFrame) -> go.Figure:
+    returns = prices.pct_change().dropna(how="all")
+    corr = returns.corr()
+    heatmap = go.Heatmap(z=corr.values, x=corr.columns, y=corr.index, colorbar=dict(title="Corr"))
+    fig = go.Figure(data=[heatmap])
+    fig.update_layout(title="Correlation of Daily Returns", margin=dict(l=10,r=10,t=30,b=10))
+    return fig
+
+def fig_to_png_bytes(fig: go.Figure) -> bytes:
+    # Requires kaleido
+    return pio.to_image(fig, format="png")
+
+def fig_to_html_bytes(fig: go.Figure) -> bytes:
+    html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True)
+    return html.encode("utf-8")
+
+def parse_portfolio(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    if filename.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    else:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    # Normalize column names
+    df.columns = [c.strip().title() for c in df.columns]
+    # Expected: Ticker, Shares, Cost Basis (optional), Weight (optional)
+    return df
+
+@st.cache_data(show_spinner=False, ttl=60 * 5)
+def get_latest_price(ticker: str) -> float:
+    t = yf.Ticker(ticker)
+    try:
+        price = _safe_float(t.fast_info.get("last_price"))
+        if np.isnan(price):
+            price = _safe_float(t.history(period="1d")["Close"].iloc[-1])
+    except Exception:
+        price = np.nan
+    return price
+
+def evaluate_portfolio(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "Ticker" not in df.columns:
+        raise ValueError("Portfolio must contain a 'Ticker' column.")
+    if "Shares" not in df.columns and "Weight" not in df.columns:
+        raise ValueError("Provide either 'Shares' or 'Weight' for each row.")
+    # Fetch prices
+    prices = []
+    for t in df["Ticker"]:
+        prices.append(get_latest_price(str(t)))
+    df["Price"] = prices
+    if "Shares" in df.columns:
+        df["Market Value"] = df["Shares"].astype(float) * df["Price"]
+    if "Cost Basis" in df.columns:
+        df["Cost Basis"] = df["Cost Basis"].astype(float)
+        if "Shares" in df.columns:
+            df["P/L"] = df["Market Value"] - df["Cost Basis"]
+            df["P/L %"] = (df["P/L"] / df["Cost Basis"]).replace([np.inf,-np.inf], np.nan) * 100.0
+    total_mv = df["Market Value"].sum(skipna=True) if "Market Value" in df.columns else np.nan
+    if "Weight" in df.columns and not np.isnan(total_mv):
+        # Reconcile weights from market values if both present
+        df["Weight (MV)"] = (df["Market Value"] / total_mv) * 100.0
+    return df
+
+# -------------------------- UI --------------------------
+
+with st.sidebar:
+    st.title("📈 Stock Market Visualizer")
+    st.caption("Powered by yfinance + Plotly")
+
+    # Config controls
+    st.subheader("Data")
+    default_ticker = "AAPL"
+    ticker = st.text_input("Ticker (single):", value=default_ticker).strip().upper()
+    today = date.today()
+    start_default = today - timedelta(days=365)
+    start = st.date_input("Start date", value=start_default, max_value=today - timedelta(days=1))
+    end = st.date_input("End date", value=today)
+    interval = st.selectbox("Interval", ["1d","1wk","1mo","1h","30m","15m","5m","1m"], index=0,
+                            help="Note: very short intervals may be limited by Yahoo Finance.")
+
+    st.subheader("Overlays")
+    ma1 = st.number_input("MA window #1", min_value=2, max_value=365, value=20, step=1)
+    ma2 = st.number_input("MA window #2", min_value=2, max_value=365, value=50, step=1)
+    ma3 = st.number_input("MA window #3", min_value=2, max_value=365, value=200, step=1)
+    ma_colors = {}
+    ma_colors[ma1] = st.color_picker(f"MA {ma1} color", "#1f77b4")
+    ma_colors[ma2] = st.color_picker(f"MA {ma2} color", "#ff7f0e")
+    ma_colors[ma3] = st.color_picker(f"MA {ma3} color", "#2ca02c")
+
+    st.markdown("---")
+    st.subheader("Bollinger Bands")
+    bb_enable = st.checkbox("Show Bollinger Bands", value=True)
+    bb_window = st.number_input("BB window", min_value=5, max_value=365, value=20, step=1)
+    bb_std = st.number_input("BB std dev", min_value=1.0, max_value=4.0, value=2.0, step=0.1)
+    bb_color_upper = st.color_picker("BB Upper color", "#8884d8")
+    bb_color_middle = st.color_picker("BB Middle color", "#444444")
+    bb_color_lower = st.color_picker("BB Lower color", "#8884d8")
+
+    st.markdown("---")
+    st.subheader("RSI")
+    rsi_window = st.number_input("RSI window", min_value=2, max_value=100, value=14, step=1)
+    rsi_low = st.number_input("RSI oversold", min_value=0, max_value=100, value=30, step=1)
+    rsi_high = st.number_input("RSI overbought", min_value=0, max_value=100, value=70, step=1)
+    rsi_color = st.color_picker("RSI line color", "#17becf")
+
+    st.markdown("---")
+    st.subheader("Theme & Export")
+    theme = st.selectbox("Plotly theme", ["plotly", "plotly_white", "plotly_dark", "presentation", "ggplot2", "seaborn"], index=1)
+    st.caption("Export options are below each chart.")
+
+    st.markdown("---")
+    st.subheader("Save / Load Config")
+    if "config" not in st.session_state:
+        st.session_state["config"] = {}
+    if st.button("Save current configuration"):
+        st.session_state["config"] = {
+            "ticker": ticker,
+            "start": str(start),
+            "end": str(end),
+            "interval": interval,
+            "ma_windows": [ma1, ma2, ma3],
+            "ma_colors": {str(ma1): ma_colors[ma1], str(ma2): ma_colors[ma2], str(ma3): ma_colors[ma3]},
+            "bb": {"enabled": bb_enable, "window": bb_window, "std": bb_std,
+                   "color_upper": bb_color_upper, "color_middle": bb_color_middle, "color_lower": bb_color_lower},
+            "rsi": {"window": rsi_window, "low": rsi_low, "high": rsi_high, "color": rsi_color},
+            "theme": theme
+        }
+    cfg_json = json.dumps(st.session_state["config"], indent=2).encode("utf-8")
+    st.download_button("⬇️ Download config (JSON)", data=cfg_json, file_name="smv_config.json", mime="application/json")
+
+    uploaded_cfg = st.file_uploader("Load a configuration (JSON)", type=["json"])
+    if uploaded_cfg is not None:
+        try:
+            cfg = json.load(uploaded_cfg)
+            st.session_state["loaded_cfg"] = cfg
+            st.success("Configuration loaded into session. Apply it from the main panel.")
+        except Exception as e:
+            st.error(f"Invalid config: {e}")
+
+st.title("Stock Market Visualizer")
+st.write("Analyze stocks with interactive candlesticks, overlays, ratios, portfolio tracking, and correlations.")
+
+# Apply loaded config
+if "loaded_cfg" in st.session_state and st.button("Apply loaded configuration"):
+    cfg = st.session_state["loaded_cfg"]
+    ticker = cfg.get("ticker", ticker)
+    try:
+        start = date.fromisoformat(cfg.get("start", str(start)))
+        end = date.fromisoformat(cfg.get("end", str(end)))
+    except Exception:
+        pass
+    interval = cfg.get("interval", interval)
+    ma_vals = cfg.get("ma_windows", [ma1, ma2, ma3])
+
+# --------------- Price + Indicators ---------------
+
+col_price, col_rsi = st.columns([2,1])
+with st.spinner("Fetching price data..."):
+    df_raw = fetch_price_history(ticker, str(start), str(end), interval)
+    if df_raw.empty:
+        st.error("No data returned. Try a different date range or interval.")
+    else:
+        ma_windows = [ma1, ma2, ma3]
+        df = compute_indicators(df_raw, ma_windows, bb_window, bb_std, rsi_window)
+
+        overlays = {
+            "ma": [{"window": w, "color": ma_colors[w]} for w in ma_windows],
+            "bollinger": {
+                "enabled": bb_enable,
+                "color_upper": bb_color_upper,
+                "color_middle": bb_color_middle,
+                "color_lower": bb_color_lower
+            }
+        }
+
+        with col_price:
+            st.subheader(f"{ticker} Candlestick")
+            fig = make_candlestick_figure(df, overlays, theme)
+            st.plotly_chart(fig, use_container_width=True)
+            png_bytes = fig_to_png_bytes(fig)
+            html_bytes = fig_to_html_bytes(fig)
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button("📸 Download PNG", data=png_bytes, file_name=f"{ticker}_chart.png", mime="image/png")
+            with dl2:
+                st.download_button("🧩 Download HTML", data=html_bytes, file_name=f"{ticker}_chart.html", mime="text/html")
+
+        with col_rsi:
+            st.subheader("RSI")
+            rsi_fig = rsi_chart(df, (rsi_low, rsi_high), rsi_color)
+            st.plotly_chart(rsi_fig, use_container_width=True)
+            st.download_button("📸 PNG (RSI)", data=fig_to_png_bytes(rsi_fig), file_name=f"{ticker}_rsi.png", mime="image/png")
+
+st.markdown("---")
+
+# --------------- Financial Ratios ---------------
+st.subheader("Key Ratios & Fast Info")
+cols = st.columns(3)
+with st.spinner("Fetching fast info..."):
+    info = fetch_fast_info(ticker)
+def fmt_pct(x):
+    return f"{x*100:.2f}%" if pd.notnull(x) else "—"
+def fmt_num(x):
+    try:
+        x = float(x)
+        for unit in ["","K","M","B","T"]:
+            if abs(x) < 1000.0:
+                return f"{x:,.2f}{unit}"
+            x /= 1000.0
+    except Exception:
+        pass
+    return "—"
+table_data = {
+    "Metric": [
+        "Price (last)","Market Cap","P/E (TTM)","Forward P/E","P/B","PEG","Dividend Yield",
+        "Profit Margin","ROE","Current Ratio","Quick Ratio","Debt/Equity","Beta","Trailing EPS","Forward EPS"
+    ],
+    "Value": [
+        fmt_num(info.get("last_price")),
+        fmt_num(info.get("marketCap")),
+        info.get("trailingPE","—"),
+        info.get("forwardPE","—"),
+        info.get("priceToBook","—"),
+        info.get("pegRatio","—"),
+        f"{_safe_float(info.get('dividendYield', np.nan))*100:.2f}%" if info.get("dividendYield") not in [None, np.nan] else "—",
+        fmt_pct(info.get("profitMargins")) if info.get("profitMargins") else "—",
+        fmt_pct(info.get("returnOnEquity")) if info.get("returnOnEquity") else "—",
+        info.get("currentRatio","—"),
+        info.get("quickRatio","—"),
+        info.get("debtToEquity","—"),
+        info.get("beta","—"),
+        info.get("trailingEps","—"),
+        info.get("forwardEps","—"),
+    ]
+}
+st.dataframe(pd.DataFrame(table_data))
+
+st.markdown("---")
+
+# --------------- Portfolio ---------------
+st.subheader("Portfolio Tracker (Upload CSV/Excel)")
+st.caption("Columns: Ticker (required), Shares or Weight, Cost Basis (optional). Example provided in repo.")
+upl = st.file_uploader("Upload portfolio file", type=["csv","xlsx","xls"])
+if upl is not None:
+    try:
+        pf = parse_portfolio(upl.read(), upl.name)
+        evaluated = evaluate_portfolio(pf)
+        st.dataframe(evaluated, use_container_width=True)
+        if "Market Value" in evaluated.columns:
+            total = evaluated["Market Value"].sum(skipna=True)
+            st.metric("Total Market Value", f"${total:,.2f}")
+        csv = evaluated.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download evaluated portfolio (CSV)", data=csv, file_name="portfolio_evaluated.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Portfolio error: {e}")
+
+st.markdown("---")
+
+# --------------- Correlation ---------------
+st.subheader("Stock Correlation Analysis")
+with st.expander("Select tickers for correlation"):
+    tickers_text = st.text_area("Tickers (space/comma separated)", value="AAPL MSFT NVDA GOOG AMZN META JPM UNH V TSLA")
+    corr_interval = st.selectbox("Interval", ["1d","1wk","1mo"], index=0)
+    corr_years = st.slider("Lookback years", min_value=1, max_value=10, value=3)
+    do_corr = st.button("Run Correlation")
+if do_corr:
+    tickers = [t.strip().upper() for t in tickers_text.replace(",", " ").split() if t.strip()]
+    start_corr = (date.today() - timedelta(days=365*corr_years)).isoformat()
+    end_corr = date.today().isoformat()
+    with st.spinner("Fetching multi-ticker prices..."):
+        prices = fetch_multi_price_history(tickers, start_corr, end_corr, corr_interval)
+    if prices.empty:
+        st.warning("No overlapping data for the selected tickers/timeframe.")
+    else:
+        fig_corr = correlation_heatmap(prices)
+        st.plotly_chart(fig_corr, use_container_width=True)
+        st.download_button("📸 PNG (Correlation)", data=fig_to_png_bytes(fig_corr), file_name="correlation.png", mime="image/png")
+        st.download_button("🧩 HTML (Correlation)", data=fig_to_html_bytes(fig_corr), file_name="correlation.html", mime="text/html")
+
+st.markdown("---")
+st.caption("Disclaimer: Data provided by Yahoo Finance via yfinance; not for trading use.")
+
+{
+  "ticker": "AAPL",
+  "start": "2024-01-01",
+  "end": "2025-08-12",
+  "interval": "1d",
+  "ma_windows": [
+    20,
+    50,
+    200
+  ],
+  "ma_colors": {
+    "20": "#1f77b4",
+    "50": "#ff7f0e",
+    "200": "#2ca02c"
+  },
+  "bb": {
+    "enabled": true,
+    "window": 20,
+    "std": 2.0,
+    "color_upper": "#8884d8",
+    "color_middle": "#444444",
+    "color_lower": "#8884d8"
+  },
+  "rsi": {
+    "window": 14,
+    "low": 30,
+    "high": 70,
+    "color": "#17becf"
+  },
+  "theme": "plotly_white"
+}
+
+# 📈 Stock Market Visualizer (Streamlit + yfinance + Plotly)
+
+Analyze and visualize stock market data with interactive candlesticks, overlays (MAs, RSI, Bollinger Bands),
+portfolio tracking, financial ratios, and correlation analysis.
+
+## Features
+- Interactive candlestick charts with moving averages, Bollinger Bands, and RSI (via Plotly)
+- Customizable lookback windows, thresholds, and colors
+- Portfolio upload (CSV/Excel) with live pricing, P/L, and weights
+- Financial ratios (best-effort from Yahoo Finance via `yfinance`)
+- Multi-ticker correlation heatmap
+- Export charts as PNG (via Kaleido) or standalone HTML
+- Save & load user configurations (download JSON, re-upload later)
+
+## Quickstart (Local)
+```bash
+# 1) Create and activate a virtual environment (recommended)
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# 2) Install dependencies
+pip install -r requirements.txt
+
+# 3) Run Streamlit
+streamlit run app.py
+```
+
+## Configuration Sharing
+- Use the sidebar to **Save current configuration**, then download the generated JSON.
+- Share that JSON and others can load it via **Load configuration (JSON)**.
+
+## Portfolio File Format
+Provide at least:
+- `Ticker` (e.g., AAPL, MSFT)
+- Either `Shares` **or** `Weight` (%)
+- Optional: `Cost Basis` (total cost currency units)
+
+See `sample_portfolio.csv` for a template.
+
+## Exporting Charts
+- Click **Download PNG** to get a static image (uses Kaleido, bundled via `requirements.txt`)
+- Click **Download HTML** to get an interactive, self-contained HTML file you can share
+
+## Deploy to Streamlit Community Cloud
+1. Push this folder to a GitHub repo.
+2. On https://share.streamlit.io, create a new app pointing to your repo, branch, and `app.py`.
+3. Add the secrets as needed (none required for this app).
+
+## GitHub Setup & CI
+```bash
+# Initialize + first push
+git init
+git add .
+git commit -m "feat: initial commit for Stock Market Visualizer"
+git branch -M main
+git remote add origin <YOUR_GITHUB_REPO_URL>
+git push -u origin main
+```
+
+This repo includes a simple GitHub Actions workflow in `.github/workflows/streamlit-check.yml` that:
+- Sets up Python
+- Installs dependencies
+- Runs a short import check to fail fast if something breaks
+
+## Notes on yfinance
+- Some fields (especially `.info`) can be slow or unavailable for certain tickers. The app guards against this,
+  but values may show as "—" when the API does not provide data.
+- Very short intervals (like 1m) may have limits or require recent date ranges.
+
+## License
+MIT
+
+
+streamlit>=1.36.0
+yfinance>=0.2.40
+pandas>=2.2.2
+numpy>=1.26.4
+plotly>=5.22.0
+kaleido>=0.2.1
+openpyxl>=3.1.2
+
+Ticker,Shares,Cost Basis
+AAPL,10,1500
+MSFT,5,1200
+NVDA,2,900
